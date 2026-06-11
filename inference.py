@@ -52,32 +52,48 @@ def find_checkpoint(subpath):
     """Try multiple checkpoint location patterns."""
     patterns = [
         f'checkpoints/{subpath}/best_model.pth',
+        f'checkpoints/{subpath}/router.pth',
         f'checkpoints/{subpath}',
         f'checkpoints/{subpath}.pth',
     ]
     for p in patterns:
         if os.path.exists(p):
             return p
-    return patterns[0]  # return default path for download
+    # Return preferred path for download (will try both dir and flat)
+    return f'checkpoints/{subpath}/best_model.pth'
 
 
 def download(url, target_path):
-    """Download checkpoint from HF."""
+    """Download checkpoint from HF. Tries both dir and flat structure."""
     if os.path.exists(target_path):
         return True
-    os.makedirs(os.path.dirname(target_path), exist_ok=True)
-    print(f'  Downloading: {url}')
-    for attempt in range(3):
-        try:
-            urllib.request.urlretrieve(url, target_path)
-            print(f'  Saved to: {target_path}')
+
+    # Determine the subpath name from target_path
+    subname = target_path.split('/')[-2] if target_path.endswith('.pth') else target_path.split('/')[-1]
+
+    # Try all possible download URLs
+    alt_paths = [
+        target_path,  # dir/best_model.pth
+        target_path.replace(f'/{subname}/best_model.pth', f'/{subname}'),  # flat name
+        target_path.replace(f'/{subname}/router.pth', f'/{subname}'),  # flat name (router)
+    ]
+    alt_paths = list(dict.fromkeys(alt_paths))  # deduplicate
+
+    for path in alt_paths:
+        if os.path.exists(path):
             return True
-        except Exception as e:
-            if attempt < 2:
-                print(f'  Retry {attempt+1}: {e}')
-            else:
-                print(f'  Failed: {e}')
-                return False
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        hf_url = f'{HF_BASE}/{path}'
+        print(f'  Downloading: {hf_url}')
+        for attempt in range(2):
+            try:
+                urllib.request.urlretrieve(hf_url, path)
+                print(f'  Saved to: {path}')
+                return True
+            except Exception:
+                if attempt == 0:
+                    continue
+    print(f'  Failed to download {subname}')
     return False
 
 
