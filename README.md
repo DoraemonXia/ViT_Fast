@@ -53,26 +53,39 @@
 
 ## 快速开始
 
+### 推理（权重自动下载）
+
 ```bash
 # 环境
 pip install torch torchvision timm pillow
 
-# 训练 baseline
-python train.py --model vit_b16 --dataset cifar100 --epochs 100
+# 运行全部模型（自动从 Hugging Face 下载权重）
+python inference.py --all --dataset cifar100 --gpu 0
 
-# 降采样训练（168×168）
-python test_downsample_train.py --dataset oxford_pets --image_size 168 --gpu 0
-
-# 灰度图训练
-python test_grayscale_train.py --dataset oxford_pets --gpu 0
-
-# MAE + Router（需先蒸馏）
-python train_router_distill.py --dataset cifar100 --gpu 0
-python train_patch_selection_mae.py --dataset cifar100 --gpu 0 \
-  --router_path ./checkpoints/router_distill_cifar100/router.pth
+# 测试指定模型
+python inference.py --model downsample168 --dataset oxford_pets --gpu 0
+python inference.py --model mae_router75 --dataset cifar100 --gpu 0
 ```
 
-## 模型权重
+| --model | 说明 | 默认数据集 |
+|:--------|:-----|:---------:|
+| `baseline` | ViT-B/16 全量 (196 patches) | cifar100 |
+| `downsample168` | 降采样 168x168 (100 patches) | cifar100 |
+| `downsample112` | 降采样 112x112 (49 patches) | cifar100 |
+| `mae_router75` | MAE + Router 保留 75% (147 patches) | cifar100 |
+| `mae_router50` | MAE + Router 保留 50% (98 patches) | cifar100 |
+| `--all` | 运行全部模型 | — |
+
+### 训练
+
+```bash
+# Baseline
+python train.py --model vit_b16 --dataset cifar100 --epochs 100
+
+# MAE + Router（需先蒸馏后训练）
+python train_router_distill.py --dataset cifar100 --gpu 0
+python train_patch_selection_mae.py --dataset cifar100 --gpu 0   --router_path ./checkpoints/router_distill_cifar100/router.pth
+```## 模型权重
 
 预训练 ViT-B/16 来自 `timm`（`vit_base_patch16_224.augreg_in21k`），自动下载。
 
