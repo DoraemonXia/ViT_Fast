@@ -12,6 +12,8 @@
 | `train.py` | 通用训练脚本（支持 baseline、patch selection、MAE finetune 等） |
 | `train_patch_selection_mae.py` | MAE patch selection 专用训练脚本（含蒸馏 router 加载） |
 | `train_router_distill.py` | Attention Distillation 训练脚本 |
+| `train_apt_patch_selection.py` | **APT 熵值 patch selection 训练脚本（新）** |
+| `train_apt_patch_merge.py` | **APT 多尺度 patch merge 训练脚本（新）** |
 | `test_patch_selection_b16.py` | 旧 Gumbel patch selection 测试脚本 |
 | `test_blur_downsample.py` | 图片模糊/降采样测试脚本 |
 | `test_stride_patches.py` | 不同 stride 下 patch 数量 vs 精度测试脚本 |
@@ -290,7 +292,129 @@ MLP Router（学生）→ 从 patch embedding 预测重要性分数 → MSE Loss
 
 ---
 
-## 检查点文件
+## APT-style 熵值 Patch Selection 实验
+
+将 APT (Adaptive Patch Tokenization, ICLR 2026) 的熵值评估方法与 ViT_Fast 框架结合，验证基于 handcrafted 熵特征的 patch 选择策略效果。
+
+### 方法
+
+用 APT 的熵值计算替代可学习 Router：对每张图计算 16×16 patch 的像素熵，保留熵值高于阈值的 patch（自适应每张图保留量），丢弃低熵区域。
+
+### 训练
+
+```bash
+# CIFAR-100
+python train_apt_patch_selection.py --dataset cifar100 --gpu 0 --threshold 5.5
+
+# Oxford Pets
+python train_apt_patch_selection.py --dataset oxford_pets --gpu 0 --threshold 5.5
+
+# Food-101
+python train_apt_patch_selection.py --dataset food101 --gpu 0 --threshold 5.5
+
+# 断点续训（自动从最新 checkpoint 恢复）
+# 直接重新运行相同命令即可
+
+# 仅评估（不训练）
+python train_apt_patch_selection.py --dataset cifar100 --gpu 0 --eval_only ./checkpoints/cifar100_apt_entropy_t5.5/best_model.pth
+
+# 自定义阈值
+python train_apt_patch_selection.py --dataset cifar100 --gpu 0 --threshold 4.0 --min_keep 16 --max_keep_ratio 0.8
+```
+
+### 参数
+
+| 参数 | 说明 | 默认值 |
+|:-----|:-----|:------:|
+| `--threshold` | 熵值阈值（越高保留越少） | 5.5 |
+| `--min_keep` | 每张图至少保留的 patch 数 | 32 |
+| `--max_keep_ratio` | 最大保留比例 | 0.9 |
+| `--multi_scale` | 启用多尺度（16+32）合并 | False |
+| `--resume PATH` | 从指定 checkpoint 恢复 | — |
+| `--eval_only PATH` | 仅评估 checkpoint | — |
+
+### 结果
+
+*训练配置：50 epochs, lr=3e-5, batch=32×4=128, label_smoothing=0.1, GPU: RTX 5070 Ti*
+
+| 数据集 | 方法 | Threshold | Keep% | Test Acc | vs Baseline (91.69%) |
+|:------|:-----|:--------:|:-----:|:--------:|:----------:|
+| CIFAR-100 | APT Entropy | 5.5 | 68.3% (133/196) | **85.84%** | **-5.85%** |
+| CIFAR-100 | MAE+Router (ref) | — | 50% | 89.07% | -2.62% |
+| CIFAR-100 | MAE+Router (ref) | — | 75% | **91.10%** | **-0.59%** |
+
+**发现：** 熵值选择在 CIFAR-100 上效果不及可学习 Router。CIFAR-100 原生 32×32，放大到 224 后，16×16 patch 熵值区分度有限——低熵区域（平坦背景）和高熵区域（物体边缘）的熵差不够大，导致选择策略误杀有用 patch。
+
+### 与可学习 Router 对比
+
+| 方法 | Acc (CIFAR-100) | Keep% | 优势 | 劣势 |
+|:-----|:------:|:-----:|:-----|:-----|
+| APT Entropy (本实验) | 85.84% | 68.3% | 无需训练，开箱即用，0 额外参数 | 手工特征，CIFAR 上区分度差 |
+| MAE + 蒸馏 Router | **89.07%** | 50% | 端到端学习，注意力引导 | 需要教师 + 蒸馏训练 |
+| MAE + 随机 Router | 88.25% | 50% | 端到端学习 | 收敛慢 |
+
+---
+
+## APT-style 多尺度 Patch Merge 实验
+
+实现与原始 APT 论文一致的多尺度合并策略：对熵值低的 2×2 patch 块（32×32 区域），将 4 个 16×16 sub-patches pooling 为 1 个 token，而不是简单丢弃。
+
+### 方法
+
+1. 计算 32×32 patch 的熵值
+2. 熵值 < threshold → 合并 4 个 sub-patches 为 1 token（平均 pooling）
+3. 熵值 >= threshold → 保持 4 个独立 tokens
+4. 合并 token 使用 7×7 位置编码（从 14×14 重采样）
+
+### 训练
+
+```bash
+# CIFAR-100
+python train_apt_patch_merge.py --dataset cifar100 --gpu 0 --threshold 5.5
+
+# Oxford Pets
+python train_apt_patch_merge.py --dataset oxford_pets --gpu 0 --threshold 5.5
+
+# 仅评估
+python train_apt_patch_merge.py --dataset cifar100 --gpu 0 --eval_only PATH
+```
+
+### 参数
+
+| 参数 | 说明 | 默认值 |
+|:-----|:-----|:------:|
+| `--threshold` | 32×32 熵值阈值（低于此值合并） | 5.5 |
+| `--resume PATH` | 从指定 checkpoint 恢复 | — |
+| `--eval_only PATH` | 仅评估 checkpoint | — |
+
+### 与 selection 策略对比
+
+| 策略 | 低熵区域处理 | 保留信息 | 实现 |
+|:-----|:-----------|:-------|:-----|
+| **APT Selection** | 丢弃 patch | 丢失 | 简单 |
+| **APT Merge** (本实验) | 4→1 合并 | 保留（粗粒度） | 接近原始 APT |
+
+### 结果
+
+*merge 在训（当前 epoch 7/50），以下为最新结果。训练配置：50 epochs, lr=3e-5, GPU: RTX 5070 Ti*
+
+| 数据集 | Threshold | 原始 tokens | 合并后 tokens | Val Acc | vs Baseline (91.69%) |
+|:------|:--------:|:----------:|:------------:|:--------:|:----------:|
+| CIFAR-100 | 5.5 | 196 | **73 (37.2%)** | **83.13%** | **-8.56%** |
+| CIFAR-100 | MAE+Router 50% (ref) | 196 | 98 (50%) | 89.07% | -2.62% |
+| CIFAR-100 | APT Selection (ref) | 196 | 133 (68.3%) | 85.84% | -5.85% |
+
+**发现：** 合并策略 token 数量最少（37.2%），但精度下降也最大（-8.56%）。CIFAR-100 上 32×32 熵值阈值 5.5 过于激进——大量 2×2 块被合并，丢失了放大后的细节。需降低阈值或在更高分辨率数据集上测试。merge 策略在 token 压缩率上有明显优势（37.2% vs Selection 68.3%），但当前精度换不来压缩率。
+
+### 两种 APT 策略对比（CIFAR-100, threshold=5.5）
+
+| 策略 | Tokens | Val Acc | 优势 | 适用场景 |
+|:-----|:------:|:-------:|:-----|:-----|
+| **Selection** | 133 (68.3%) | **85.84%** | 精度更好，实现简单 | 对精度要求高 |
+| **Merge** | 73 (37.2%) | 83.13% | Token 数少 45%，计算更小 | 对速度要求高，或高分辨率原图 |
+| **MAE+Router** | 98 (50%) | 89.07% | 最佳精度/压缩平衡 | 有教师模型可用时 |
+
+---
 
 ```
 checkpoints/

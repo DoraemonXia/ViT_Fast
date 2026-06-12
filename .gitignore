@@ -1,6 +1,7 @@
 data/
 *.pyc
 __pycache__/
-checkpoints/*.pth
+checkpoints/**/*.pth
+checkpoints/**/*.json
 logs/
 .claude/

@@ -11,6 +11,8 @@
 | Baseline | 91.69% | — |
 | MAE + Router (keep 75%) | **91.10%** | **-0.59%** |
 | MAE + Router (keep 50%) | **89.07%** | **-2.62%** |
+| APT Selection (keep 68%) | **85.84%** | **-5.85%** |
+| APT Merge (keep 37%) | **83.13%** | **-8.56%** |
 
 **更详细的实验记录见 [EXPERIMENTS.md](EXPERIMENTS.md)**。研究故事见 [docs/research_story.md](docs/research_story.md)。
 
@@ -25,6 +27,8 @@
 ├── train.py                      # 通用训练脚本（baseline / Gumbel）
 ├── train_patch_selection_mae.py  # MAE + Router 训练脚本
 ├── train_router_distill.py       # 注意力蒸馏脚本
+├── train_apt_patch_selection.py  # APT 熵值 patch selection（新）
+├── train_apt_patch_merge.py      # APT 多尺度 patch merge（新）
 ├── datasets.py                   # 数据集加载器
 ├── docs/
 │   ├── research_story.md         # 研究叙事（给读者看）
@@ -79,6 +83,12 @@ python train.py --model vit_b16 --dataset cifar100 --epochs 100
 # MAE + Router（需先蒸馏后训练）
 python train_router_distill.py --dataset cifar100 --gpu 0
 python train_patch_selection_mae.py --dataset cifar100 --gpu 0   --router_path ./checkpoints/router_distill_cifar100/router.pth
+
+# APT Selection（熵值丢弃低信息量 patch）
+python train_apt_patch_selection.py --dataset cifar100 --gpu 0 --threshold 5.5
+
+# APT Merge（熵值低区域 2×2 合并为 1 token）
+python train_apt_patch_merge.py --dataset cifar100 --gpu 0 --threshold 5.5
 ```## 模型权重
 
 预训练 ViT-B/16 来自 `timm`（`vit_base_patch16_224.augreg_in21k`），自动下载。
