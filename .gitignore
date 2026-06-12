@@ -1,6 +1,9 @@
 data/
+.venv/
 *.pyc
 __pycache__/
+checkpoints/*
+!checkpoints/README.md
 checkpoints/**/*.pth
 checkpoints/**/*.json
 logs/

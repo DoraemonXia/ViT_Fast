@@ -4,3 +4,4 @@ timm>=0.9.0
 fvcore
 Pillow
 numpy
+tqdm

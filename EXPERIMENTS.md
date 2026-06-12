@@ -14,12 +14,14 @@
 | `train_router_distill.py` | Attention Distillation 训练脚本 |
 | `train_apt_patch_selection.py` | **APT 熵值 patch selection 训练脚本（新）** |
 | `train_apt_patch_merge.py` | **APT 多尺度 patch merge 训练脚本（新）** |
+| `eval_training_free_token_reduction.py` | **Training-free ToMe / EViT token reduction 评估脚本** |
 | `test_patch_selection_b16.py` | 旧 Gumbel patch selection 测试脚本 |
 | `test_blur_downsample.py` | 图片模糊/降采样测试脚本 |
 | `test_stride_patches.py` | 不同 stride 下 patch 数量 vs 精度测试脚本 |
 | `datasets.py` | 数据集加载器：CIFAR-10/100, Oxford Pets, Food-101, Tiny-ImageNet, DTD, Flowers-102, Stanford Cars |
 | `checkpoints/` | 所有模型权重 |
 | `logs/` | 训练日志 |
+| `results/` | 实验结果表格与 JSONL 记录 |
 | `SHARED_MEMORY.md` | 跨 Claude Code 会话共享记忆 |
 
 ### models.py — 模型类
@@ -106,21 +108,60 @@ python train_patch_selection_mae.py --dataset cifar100 --gpu 4 \
 python train.py --model patch_selection_vit_b16 --dataset cifar100
 ```
 
-### 4. 测试图片预处理（模糊/降采样）
+### 4. Training-free ToMe / EViT 评估（不训练）
+
+这组实验直接复用已微调的 ViT-B/16 checkpoint，在推理阶段插入 token reduction 模块，不重新训练模型。
+对 CIFAR-100 来说，默认 baseline 是组长开放的 full ViT-B/16 微调权重 `checkpoints/cifar100_vit_b16_ft`，不是 MAE+Router 或 168 分辨率下采样权重；脚本默认优先读取 `checkpoints/` 下的本地权重，只有显式加 `--download` 时才会联网下载。
+
+```bash
+# ToMe-style：每个 Transformer block 合并 r 个相似 token
+python eval_training_free_token_reduction.py \
+  --method tome \
+  --dataset cifar100 \
+  --tome_r_values 4,8,13 \
+  --gpu 0
+
+# ToMe-style：按目标保留比例自动分配 per-layer r schedule
+python eval_training_free_token_reduction.py \
+  --method tome \
+  --dataset cifar100 \
+  --tome_keep_ratios 0.75,0.68,0.50 \
+  --gpu 0
+
+# EViT-style：第 3 个 block 后用 CLS→patch attention 保留高分 patch
+python eval_training_free_token_reduction.py \
+  --method evit \
+  --dataset cifar100 \
+  --evit_keep_ratios 0.75,0.68,0.50 \
+  --evit_layer 3 \
+  --gpu 0
+
+# 快速 smoke test：只跑前 5 个 batch
+python eval_training_free_token_reduction.py --method all --dataset cifar100 --max_batches 5
+```
+
+脚本会自动追加结果到：
+
+- `results/training_free_token_reduction.csv`：用于整理最终报告表格。
+- `results/training_free_token_reduction.jsonl`：保留每次运行参数，便于复盘。
+
+如果只想临时看终端输出，不写入结果文件，加 `--no_save_results`。
+
+### 5. 测试图片预处理（模糊/降采样）
 
 ```bash
 python test_blur_downsample.py --dataset cifar100 --gpu 5
 # 测试 Gaussian blur、降采样等预处理对精度的影响（不减少 token 数量）
 ```
 
-### 5. 测试 Stride-based Patch 减少
+### 6. 测试 Stride-based Patch 减少
 
 ```bash
 python test_stride_patches.py --dataset cifar100 --gpu 5
 # 测试不同 stride 下 patch 数量 vs 精度（直接减少 token 数量）
 ```
 
-### 6. 降采样图片训练（减小输入分辨率）
+### 7. 降采样图片训练（减小输入分辨率）
 
 ```bash
 # 112×112 → 49 patches (75% reduction)
@@ -140,7 +181,7 @@ python test_downsample_train.py --dataset cifar100 --image_size 168 --gpu 5
 # 输出：checkpoints/{dataset}_vit_b16_img{size}/best_model.pth
 ```
 
-### 7. 通用训练脚本 train.py 全部参数
+### 8. 通用训练脚本 train.py 全部参数
 
 ```bash
 python train.py \
@@ -489,6 +530,95 @@ checkpoints/
 | Decoder dim | 512 |
 | Decoder depth | 4 |
 | Epochs | CIFAR-100: 100, Oxford Pets: 100, Food-101: 30 |
+
+---
+
+## Training-free ToMe / EViT Token Reduction 实验
+
+本实验直接复用已微调的 ViT-B/16 checkpoint，在推理阶段插入 token reduction 模块，不重新训练模型。对 CIFAR-100 来说，默认 baseline 是组长开放的 full ViT-B/16 微调权重 `checkpoints/cifar100_vit_b16_ft`，不是 MAE+Router 或 168 分辨率下采样权重。本节的目标不是重新训练一个更强模型，而是验证一个更轻量的问题：**已经训练好的 ViT 中是否存在可被即插即用利用的 token 冗余，以及这种冗余能否在较小精度损失下换来推理加速**。
+
+### 方法
+
+本实验使用 `eval_training_free_token_reduction.py` 统一评估 baseline、ToMe-style merge 和 EViT-style prune。输入图像仍然按照原始 ViT-B/16 方式切成 14×14 个 patch，也就是 196 个 patch tokens，再加上 CLS token。需要注意的是，这类方法主要减少的是 Transformer blocks 内部后续层的 token 数，节省 self-attention 和 MLP 的计算；它并不改变最开始的 patch embedding 过程，因此不是“输入图像少切 patch”，而是“进入主干后逐步减少参与计算的 token”。
+
+ToMe-style 的核心不是重新切图，也不是重新训练 Router，而是在已经训练好的 ViT block 内部插入 token merging。每个 block 的 attention 计算后，脚本用 attention 中的 key 表征作为 token similarity metric，将相似 token 以 bipartite matching 的方式逐层合并。直观理解是：如果两个 patch token 在当前网络看来表达的视觉语义非常接近，就把它们合成一个 token，让后续层只处理这个合并后的表示。这里的 `r` 表示每个 Transformer block 合并多少个 token，所以 r 越大，最终剩余 token 越少，推理越快，但信息压缩也越激进。
+
+ToMe 的实现有两个关键细节。第一，CLS token 被固定保护，不参与合并，因为最终分类依赖 CLS token 汇聚全局信息，如果 CLS 被合并或删除，分类头的输入语义会被破坏。第二，被合并后的 token 会追踪 `size`，也就是它代表多少个原始 token；后续 attention logits 会加入 `log(size)` 做 proportional attention，避免一个代表多个 patch 的 merged token 被当成普通单 patch token 处理。没有这个 size correction，合并 token 在后续注意力中容易被低估，精度会明显不稳定。
+
+EViT-style 在本实验中作为 attention-guided pruning baseline。模型先正常跑到第 3 个 block，然后取 CLS token 对各个 patch 的 attention 分数，保留高分 patch，低分 patch 直接丢弃。它和 ToMe 的区别是：EViT 是 prune，低分 token 被直接移除；ToMe 是 merge，相似 token 被融合成一个代表性 token。换句话说，EViT 假设“低 attention patch 不重要，可以不要”，ToMe 假设“相似 patch 有冗余，可以合并”。前者更直接，后者更保守。
+
+完整推理流程如下：
+
+1. 加载 CIFAR-100 full ViT-B/16 baseline checkpoint。
+2. 对同一个 checkpoint 分别运行 baseline、ToMe-style、EViT-style。
+3. Baseline 不减少 token，始终使用 196 个 patch tokens。
+4. ToMe-style 在每个 block 后按相似度逐层合并 token，测试 `r=0/4/8/13`。
+5. EViT-style 在第 3 个 block 后按 CLS→patch attention 分数一次性 prune，测试 keep ratio `0.75/0.68/0.50`。
+6. 统计准确率、平均 token 数、forward latency 和 throughput。
+
+实现约束：
+- ToMe 使用 **per-layer r**，不是只在某一层一次性砍掉大量 token。
+- ToMe 保护 CLS token，不参与合并。
+- ToMe 追踪 merged token size，并在后续 attention 中加入 `log(size)` 做 proportional attention。
+- EViT-style prune 只作为 training-free attention baseline。
+
+公平对比口径：
+- Training-free 组：Baseline、ToMe、EViT、可选未训练 entropy heuristic。
+- Trained 组：APT Entropy、APT Merge、MAE+Router。
+- 除非对 ToMe/EViT 也补 5-10 epoch 微调，否则不能直接得出“相似度/attention 准则不如 entropy”的结论。
+
+### 运行
+
+```bash
+# 一次跑 baseline / ToMe / EViT
+python eval_training_free_token_reduction.py --method all --dataset cifar100 --gpu 0
+
+# 只跑 ToMe-style
+python eval_training_free_token_reduction.py --method tome --dataset cifar100 --tome_r_values 4,8,13 --gpu 0
+
+# 只跑 EViT-style
+python eval_training_free_token_reduction.py --method evit --dataset cifar100 --evit_keep_ratios 0.75,0.68,0.50 --evit_layer 3 --gpu 0
+```
+
+脚本会自动追加结果到：
+
+- `results/training_free_token_reduction.csv`：用于整理最终报告表格。
+- `results/training_free_token_reduction.jsonl`：保留每次运行参数，便于复盘。
+
+### 结果
+
+结果来源：`results/training_free_token_reduction.csv`，run_id=`20260612_213317`。测试集为 CIFAR-100 full test set（10000 samples, 79 batches），batch size=128，device=`cuda:0`，checkpoint=`checkpoints/cifar100_vit_b16_ft`。Latency/throughput 统计的是模型 forward 时间，不包含数据下载时间。
+
+| 方法 | 设置 | Tokens | Token 保留率 | Acc | vs Baseline | Latency | Latency 降低 | Throughput | 加速比 |
+|:-----|:-----|------:|------------:|----:|------------:|--------:|-------------:|-----------:|------:|
+| Baseline ViT-B/16 | full | 196/196 | 100.0% | 91.69% | — | 27.49 ms | — | 36.37/s | 1.00x |
+| ToMe-style | r=0 | 196/196 | 100.0% | 91.69% | +0.00% | 27.80 ms | -1.1% | 35.97/s | 0.99x |
+| ToMe-style | r=4 | 148/196 | 75.5% | 91.54% | -0.15% | 23.51 ms | 14.5% | 42.54/s | 1.17x |
+| ToMe-style | r=8 | 100/196 | 51.0% | 91.34% | -0.35% | 19.85 ms | 27.8% | 50.37/s | 1.38x |
+| ToMe-style | r=13 | 40/196 | 20.4% | 90.68% | -1.01% | 15.65 ms | 43.1% | 63.91/s | 1.76x |
+| EViT-style | keep=0.75, layer=3 | 147/196 | 75.0% | 90.80% | -0.89% | 21.16 ms | 23.0% | 47.26/s | 1.30x |
+| EViT-style | keep=0.68, layer=3 | 133/196 | 67.9% | 90.14% | -1.55% | 19.78 ms | 28.1% | 50.56/s | 1.39x |
+| EViT-style | keep=0.50, layer=3 | 98/196 | 50.0% | 86.91% | -4.78% | 17.09 ms | 37.8% | 58.52/s | 1.61x |
+
+### 发现
+
+本组实验说明，在不重新训练的情况下，ToMe-style 可以稳定减少 Transformer 主干中的 token 数，并带来实际推理加速。baseline 使用 196 个 patch tokens，准确率为 91.69%，forward latency 为 27.49 ms。ToMe r=4 后 token 降到 148，准确率为 91.54%，只下降 0.15%，latency 降低 14.5%；这说明 ViT-B/16 在 CIFAR-100 上存在明显 token 冗余，少量合并相似 token 基本不会破坏分类能力。
+
+ToMe r=8 是当前最均衡的设置。它把 token 从 196 降到 100，接近减少一半，但准确率仍有 91.34%，只比 baseline 低 0.35%。与此同时，latency 从 27.49 ms 降到 19.85 ms，throughput 从 36.37/s 提升到 50.37/s，约等价于 1.38x forward 加速。这个结果对报告最有价值，因为它同时满足三个条件：不需要训练、token 数显著减少、精度损失很小。
+
+ToMe r=13 是激进压缩设置。它只保留约 40/196 个 tokens，token 保留率为 20.4%，latency 降低 43.1%，throughput 达到 63.91/s，约 1.76x 加速；但准确率下降到 90.68%，相对 baseline 掉 1.01%。这个结果说明 ToMe 在高压缩率下仍然没有崩溃，但精度-速度权衡已经开始明显偏向速度。因此 r=13 更适合作为 ablation，用来展示压缩强度继续增加时的边界，而不一定作为默认推荐配置。
+
+EViT-style 在相近 token 数下精度损失更大。比如 ToMe r=8 保留 100 tokens，Acc=91.34%；EViT keep=0.50 保留 98 tokens，Acc=86.91%。两者 token 数几乎一致，但 EViT 掉点达到 -4.78%，说明“直接丢弃低 attention token”在当前设置下更容易误删有用信息。EViT keep=0.75 的 token 数为 147，和 ToMe r=4 的 148 tokens 接近，但准确率为 90.80%，明显低于 ToMe r=4 的 91.54%。因此，在本实验中，相似度驱动的 merge 比 CLS-attention 驱动的 prune 更稳定。
+
+从机制上看，ToMe 的优势来自“压缩而不是删除”。背景、纹理或重复区域中的 patch token 往往表达相近，merge 会把它们融合成一个更粗粒度的表示，仍然给后续 Transformer 层保留一定信息；prune 则会直接删除 token，一旦 attention 分数在浅层判断不准，就会造成不可恢复的信息损失。CIFAR-100 原始分辨率只有 32×32，放大到 224×224 后，很多 patch 之间确实存在重复和冗余，这也解释了为什么 ToMe r=8 能在减少约一半 token 的情况下仍保持接近 baseline 的准确率。
+
+与训练过的方法相比，这组结果要单独解读。APT Entropy、APT Merge、MAE+Router 都经历过训练或微调，模型参数已经适应了 token reduction；ToMe/EViT 在这里是 training-free，完全不更新参数。因此，ToMe r=8 的意义不是“严格公平地超过某个 trained 方法”，而是证明：**在已有 full ViT checkpoint 上，不经过额外训练也能通过相似度合并获得接近 baseline 的精度和明显的推理加速**。如果后续要和 APT/MAE+Router 做严格对比，应对 ToMe 的最佳设置补充 5-10 epoch 微调。
+
+可直接用于报告的结论表述：
+
+> We evaluate a training-free ToMe-style token merging module on a fine-tuned ViT-B/16 checkpoint. Without any additional training, ToMe r=8 reduces the average number of patch tokens from 196 to 100 while maintaining 91.34% accuracy on CIFAR-100, only 0.35% below the full-token baseline. The forward latency decreases from 27.49 ms to 19.85 ms, giving about 1.38x speedup. Compared with EViT-style attention pruning under a similar token budget, similarity-based merging preserves accuracy much better, suggesting that merging redundant tokens is more robust than directly discarding low-attention tokens in this setting.
+
+中文报告可以表述为：本实验验证了 ViT 中存在可被即插即用方法利用的 token 冗余。相似度驱动的 ToMe-style token merging 不依赖额外训练，也不需要教师模型或蒸馏 Router，却能在 CIFAR-100 上将 token 数接近减半，同时仅带来 0.35% 的精度损失，并获得约 1.38 倍 forward 加速。相比之下，EViT-style attention pruning 在相似 token 数下掉点更明显，说明直接丢弃 token 的风险高于合并冗余 token。
 
 ---
 

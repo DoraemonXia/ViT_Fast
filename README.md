@@ -29,6 +29,7 @@
 ├── train_router_distill.py       # 注意力蒸馏脚本
 ├── train_apt_patch_selection.py  # APT 熵值 patch selection（新）
 ├── train_apt_patch_merge.py      # APT 多尺度 patch merge（新）
+├── eval_training_free_token_reduction.py # ToMe / EViT 即插即用评估
 ├── datasets.py                   # 数据集加载器
 ├── docs/
 │   ├── research_story.md         # 研究叙事（给读者看）
@@ -36,7 +37,8 @@
 │   ├── all_experiments_guide.png # 实验可视化对照图
 │   └── resolution_sweep_guide.png# 分辨率扫描对照图
 ├── checkpoints/                  # 模型权重（见下方下载）
-└── logs/                         # 训练日志
+├── logs/                         # 训练日志
+└── results/                      # 实验结果 CSV / JSONL
 ```
 
 ## 支持的数据集
@@ -53,13 +55,13 @@
 
 ## 快速开始
 
-### 推理（权重自动下载）
+### 推理（本地权重）
 
 ```bash
 # 环境
-pip install torch torchvision timm pillow
+pip install torch torchvision timm pillow tqdm
 
-# 运行全部模型（自动从 Hugging Face 下载权重）
+# 运行全部模型（默认使用 checkpoints/ 下的本地权重）
 python inference.py --all --dataset cifar100 --gpu 0
 
 # 测试指定模型
@@ -73,6 +75,25 @@ python inference.py --model mae_router50 --dataset cifar100 --gpu 0
 | `mae_router75` | MAE + Router 保留 75% (147 patches) | cifar100 |
 | `mae_router50` | MAE + Router 保留 50% (98 patches) | cifar100 |
 | `--all` | 运行全部模型 | — |
+
+### Training-free token reduction（不训练）
+
+脚本默认使用 CIFAR-100 的 full ViT-B/16 微调权重 `checkpoints/cifar100_vit_b16_ft` 作为 baseline，并优先从 `checkpoints/` 读取本地权重；只有显式加 `--download` 时才会联网下载。
+
+```bash
+# ToMe：每层逐步合并 r 个相似 token；保护 CLS，使用 proportional attention
+python eval_training_free_token_reduction.py --method tome --dataset cifar100 --tome_r_values 4,8,13 --gpu 0
+
+# EViT-style：用浅层 CLS→patch attention 直接 prune
+python eval_training_free_token_reduction.py --method evit --dataset cifar100 --evit_keep_ratios 0.75,0.68,0.50 --evit_layer 3 --gpu 0
+
+# 一次跑 baseline / ToMe / EViT
+python eval_training_free_token_reduction.py --method all --dataset cifar100 --gpu 0
+```
+
+这组结果是 **training-free**，只适合和同样不训练的 ToMe / EViT / entropy heuristic 互相比较；APT Entropy、APT Merge、MAE+Router 属于已训练或微调方法，应放在单独表格里作为参考。
+
+运行结果会自动追加到 `results/training_free_token_reduction.csv` 和 `results/training_free_token_reduction.jsonl`。如果只想在终端查看，不写文件，加 `--no_save_results`。
 
 ### 训练
 

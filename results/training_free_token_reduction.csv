@@ -1,0 +1,9 @@
+run_id,timestamp,dataset,result_group,method,setting,checkpoint,checkpoint_path,timm_pretrained,batch_size,num_workers,max_batches,samples,batches,tokens,num_patches,token_keep_ratio,acc,latency_ms,throughput_s,device,tome_r_values,tome_keep_ratios,evit_keep_ratios,evit_layer
+20260612_213317,2026-06-12T21:33:17,cifar100,training-free,baseline,full,auto,checkpoints/cifar100_vit_b16_ft,False,128,4,,10000,79,196.0,196,1.0,91.69,27.4932,36.3726,cuda:0,"0,4,8,13",,"0.75,0.68,0.50",3
+20260612_213317,2026-06-12T21:33:17,cifar100,training-free,tome,r=0,auto,checkpoints/cifar100_vit_b16_ft,False,128,4,,10000,79,196.0,196,1.0,91.69,27.799,35.9725,cuda:0,"0,4,8,13",,"0.75,0.68,0.50",3
+20260612_213317,2026-06-12T21:33:17,cifar100,training-free,tome,r=4,auto,checkpoints/cifar100_vit_b16_ft,False,128,4,,10000,79,148.0,196,0.755102,91.54,23.505,42.5441,cuda:0,"0,4,8,13",,"0.75,0.68,0.50",3
+20260612_213317,2026-06-12T21:33:17,cifar100,training-free,tome,r=8,auto,checkpoints/cifar100_vit_b16_ft,False,128,4,,10000,79,100.0,196,0.510204,91.34,19.8534,50.3691,cuda:0,"0,4,8,13",,"0.75,0.68,0.50",3
+20260612_213317,2026-06-12T21:33:17,cifar100,training-free,tome,r=13,auto,checkpoints/cifar100_vit_b16_ft,False,128,4,,10000,79,40.0,196,0.204082,90.68,15.6475,63.9081,cuda:0,"0,4,8,13",,"0.75,0.68,0.50",3
+20260612_213317,2026-06-12T21:33:17,cifar100,training-free,evit,"keep=0.75, layer=3",auto,checkpoints/cifar100_vit_b16_ft,False,128,4,,10000,79,147.0,196,0.75,90.8,21.1605,47.2579,cuda:0,"0,4,8,13",,"0.75,0.68,0.50",3
+20260612_213317,2026-06-12T21:33:17,cifar100,training-free,evit,"keep=0.68, layer=3",auto,checkpoints/cifar100_vit_b16_ft,False,128,4,,10000,79,133.0,196,0.678571,90.14,19.7797,50.5568,cuda:0,"0,4,8,13",,"0.75,0.68,0.50",3
+20260612_213317,2026-06-12T21:33:17,cifar100,training-free,evit,"keep=0.50, layer=3",auto,checkpoints/cifar100_vit_b16_ft,False,128,4,,10000,79,98.0,196,0.5,86.91,17.089,58.517,cuda:0,"0,4,8,13",,"0.75,0.68,0.50",3
