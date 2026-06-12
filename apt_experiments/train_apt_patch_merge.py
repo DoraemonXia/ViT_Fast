@@ -18,11 +18,11 @@ Architecture:
     → ViT Blocks → CLS → 分类
 
 Usage:
-  python train_apt_patch_merge.py --dataset cifar100 --gpu 0
-  python train_apt_patch_merge.py --dataset oxford_pets --gpu 0 --threshold 5.0
+  python apt_experiments/train_apt_patch_merge.py --dataset cifar100 --gpu 0
+  python apt_experiments/train_apt_patch_merge.py --dataset oxford_pets --gpu 0 --threshold 5.0
 
   # 仅评估
-  python train_apt_patch_merge.py --dataset cifar100 --gpu 0 --eval_only PATH
+  python apt_experiments/train_apt_patch_merge.py --dataset cifar100 --gpu 0 --eval_only PATH
 """
 import torch
 import torch.nn as nn
@@ -30,12 +30,29 @@ import torch.nn.functional as F
 import time
 import os
 import sys
-import math
+import random
 import argparse
 import json
+import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from datasets import get_cifar100_loader, get_oxford_pets_loader, get_food101_loader
+APT_ROOT = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(APT_ROOT)
+sys.path.insert(0, APT_ROOT)
+sys.path.insert(0, PROJECT_ROOT)
+from datasets import (
+    get_cifar100_loader,
+    get_dtd_loader,
+    get_food101_loader,
+    get_oxford_pets_loader,
+)
+from apt_utils import (
+    TokenStatsAccumulator,
+    compute_patch_entropy,
+    denormalize_to_255,
+    get_normalization,
+    run_masked_vit_blocks,
+    write_result_json,
+)
 from tqdm import tqdm
 import timm
 
@@ -45,52 +62,9 @@ import timm
 # ==============================================================================
 
 def compute_patch_entropy_fast(images_255, patch_size=16, num_scales=2, bins=64):
-    """Fast entropy via scatter_add (avoids huge one-hot tensor)."""
-    B, C, H, W = images_255.shape
-    device = images_255.device
-
-    if C == 3:
-        w_rgb = torch.tensor([0.2989, 0.5870, 0.1140], device=device).view(1, 3, 1, 1)
-        gray = (images_255 * w_rgb).sum(dim=1)
-    else:
-        gray = images_255[:, 0]
-
-    entropy_maps = {}
+    """Compatibility wrapper around the shared entropy implementation."""
     patch_sizes = [patch_size * (2 ** i) for i in range(num_scales)]
-
-    for ps in patch_sizes:
-        n_h = (H + ps - 1) // ps
-        n_w = (W + ps - 1) // ps
-        pad_h = n_h * ps - H
-        pad_w = n_w * ps - W
-        padded = F.pad(gray, (0, pad_w, 0, pad_h), mode='constant', value=0)
-
-        patches = padded.unfold(1, ps, ps).unfold(2, ps, ps)
-        flat = patches.reshape(B, n_h, n_w, ps * ps)
-        flat_int = (flat * (bins / 256.0)).long().clamp(0, bins - 1)
-
-        N_blocks = B * n_h * n_w
-        flat_2d = flat_int.reshape(N_blocks, ps * ps)  # (N, P)
-
-        # Scatter-add histogram: offset each block's indices into flattened array
-        offsets = torch.arange(N_blocks, device=device).unsqueeze(1) * bins
-        idx = (flat_2d + offsets).reshape(-1)
-        hist_flat = torch.zeros(N_blocks * bins, device=device, dtype=torch.float32)
-        hist_flat.scatter_add_(0, idx, torch.ones_like(idx, dtype=torch.float32))
-        hist = hist_flat.reshape(N_blocks, bins)
-
-        hist = hist.reshape(B, n_h, n_w, bins)
-        probs = hist / (ps * ps)
-        eps = 1e-10
-        emap = -torch.sum(probs * torch.log2(probs + eps), dim=3)
-
-        if pad_h > 0:
-            emap[:, -1, :] = 1e6
-        if pad_w > 0:
-            emap[:, :, -1] = 1e6
-
-        entropy_maps[ps] = emap
-    return entropy_maps
+    return compute_patch_entropy(images_255, patch_sizes=patch_sizes, bins=bins)
 
 
 # ==============================================================================
@@ -115,13 +89,20 @@ class APTPatchMergeViT(nn.Module):
     """
 
     def __init__(self, num_classes=100, merge_threshold=5.5,
-                 img_size=224, pretrained=True, drop_path_rate=0.0):
+                 img_size=224, pretrained=True, drop_path_rate=0.0,
+                 input_mean=(0.485, 0.456, 0.406),
+                 input_std=(0.229, 0.224, 0.225),
+                 entropy_bins=64,
+                 backbone_name='vit_base_patch16_224.augreg_in21k'):
         super().__init__()
         self.merge_threshold = merge_threshold
         self.img_size = img_size
+        self.input_mean = input_mean
+        self.input_std = input_std
+        self.entropy_bins = entropy_bins
 
         backbone = timm.create_model(
-            'vit_base_patch16_224.augreg_in21k',
+            backbone_name,
             pretrained=pretrained,
             num_classes=num_classes,
             drop_path_rate=drop_path_rate,
@@ -162,6 +143,7 @@ class APTPatchMergeViT(nn.Module):
         self._last_k = self.num_patches
         self._last_n = self.num_patches
         self._last_merged = 0
+        self._last_token_counts = None
 
         del backbone
 
@@ -169,12 +151,10 @@ class APTPatchMergeViT(nn.Module):
         B, C, H, W = x.shape
 
         # Step 1: Unnormalize and compute entropy at two scales
-        mean = torch.tensor([0.5, 0.5, 0.5], device=x.device).view(1, 3, 1, 1)
-        std = torch.tensor([0.5, 0.5, 0.5], device=x.device).view(1, 3, 1, 1)
-        images_255 = ((x * std + mean) * 255.0).clamp(0, 255)
+        images_255 = denormalize_to_255(x, self.input_mean, self.input_std)
 
         entropy_maps = compute_patch_entropy_fast(
-            images_255, patch_size=16, num_scales=2)
+            images_255, patch_size=16, num_scales=2, bins=self.entropy_bins)
         entropy32 = entropy_maps[32]  # (B, 7, 7)
 
         # Step 2: Patch embedding (ALL 196 patches)
@@ -248,9 +228,8 @@ class APTPatchMergeViT(nn.Module):
             valid_mask,
         ], dim=1).unsqueeze(-1)  # (B, 1+K_max, 1)
 
-        for block in self.blocks:
-            h = block(h)
-            h = h * pad_mask.float()
+        h = run_masked_vit_blocks(
+            self.blocks, h, pad_mask.squeeze(-1))
 
         h = self.norm(h)
         logits = self.head(h[:, 0])
@@ -258,6 +237,7 @@ class APTPatchMergeViT(nn.Module):
         self._last_k = K_max
         self._last_n = self.num_patches
         self._last_merged = num_merged.float().mean().item()
+        self._last_token_counts = K_per_image.detach()
 
         return logits
 
@@ -270,12 +250,14 @@ DATASETS = {
     'cifar100':    (get_cifar100_loader,     100, 100),
     'oxford_pets': (get_oxford_pets_loader,   37, 100),
     'food101':     (get_food101_loader,      101,  30),
+    'dtd':         (get_dtd_loader,            47, 100),
 }
 
 BASELINE_ACC = {
     'cifar100':   91.69,
     'oxford_pets': 93.81,
     'food101':    91.37,
+    'dtd':        80.85,
 }
 
 
@@ -332,7 +314,7 @@ def evaluate(model, loader, criterion, device, track_patches=False, desc='Eval')
     total_loss = 0.0
     correct = 0
     total = 0
-    kept_tokens = []
+    token_stats = TokenStatsAccumulator() if track_patches else None
     pbar = tqdm(loader, total=len(loader), desc=desc, unit='batch', dynamic_ncols=True)
     for images, targets in pbar:
         images, targets = images.to(device), targets.to(device)
@@ -343,17 +325,18 @@ def evaluate(model, loader, criterion, device, track_patches=False, desc='Eval')
         total += targets.size(0)
         correct += predicted.eq(targets).sum().item()
         if track_patches:
-            kept_tokens.append(model._last_k)
+            token_stats.update(model._last_token_counts, model._last_k)
         pbar.set_postfix({
             'loss': f'{total_loss / (pbar.n if pbar.n else 1):.4f}',
             'acc': f'{100.0 * correct / total:.1f}%',
         })
 
     result = (total_loss / len(loader), 100.0 * correct / total)
-    if track_patches and kept_tokens:
-        avg_k = sum(kept_tokens) / len(kept_tokens)
+    if track_patches:
+        stats = token_stats.compute()
+        avg_k = stats.mean
         avg_n = model._last_n
-        result = result + (avg_k, avg_n, avg_k / avg_n * 100)
+        result = result + (avg_k, avg_n, avg_k / avg_n * 100, stats)
     return result
 
 
@@ -404,16 +387,28 @@ def main():
     parser.add_argument('--epochs', type=int, default=None,
                         help='Override default epoch count')
     parser.add_argument('--image_size', type=int, default=224)
+    parser.add_argument('--entropy_bins', type=int, default=64)
+    parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from')
     parser.add_argument('--eval_only', type=str, default=None,
                         help='Only evaluate using the given checkpoint path')
     args = parser.parse_args()
 
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
     device = f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu'
     print(f'Device: {device}', flush=True)
     if torch.cuda.is_available():
         print(f'GPU: {torch.cuda.get_device_name(args.gpu)}', flush=True)
+    elif args.eval_only is None:
+        raise RuntimeError(
+            'CUDA is required for training. CPU is limited to direct model smoke tests.'
+        )
 
     loader_fn, num_classes, epochs = DATASETS[args.dataset]
     if args.epochs is not None:
@@ -427,8 +422,12 @@ def main():
     print(f'  Merge threshold (32x32): {args.threshold}', flush=True)
     print(f'  Baseline Acc: {BASELINE_ACC[args.dataset]:.2f}%', flush=True)
 
-    result = loader_fn(batch_size=args.batch_size, data_dir='./data',
-                       num_workers=4, image_size=args.image_size)
+    loader_kwargs = dict(batch_size=args.batch_size,
+                         data_dir=os.path.join(PROJECT_ROOT, 'data'),
+                         num_workers=4, image_size=args.image_size)
+    if args.dataset == 'cifar100':
+        loader_kwargs['return_val'] = True
+    result = loader_fn(**loader_kwargs)
     if len(result) == 4:
         train_loader, val_loader, test_loader, n_cls = result
         val_is_test = False
@@ -446,6 +445,9 @@ def main():
         num_classes=n_cls,
         merge_threshold=args.threshold,
         img_size=args.image_size,
+        input_mean=get_normalization(args.dataset)[0],
+        input_std=get_normalization(args.dataset)[1],
+        entropy_bins=args.entropy_bins,
     )
     model = model.to(device)
     total_params = sum(p.numel() for p in model.parameters()) / 1e6
@@ -459,7 +461,13 @@ def main():
     best_val_acc = 0.0
     best_epoch = -1
     start_epoch = 0
-    save_dir = f'./checkpoints/{args.dataset}_apt_merge_t{args.threshold}'
+    save_dir = (
+        os.path.join(
+            APT_ROOT,
+            'checkpoints',
+            f'{args.dataset}_apt_merge_t{args.threshold}_s{args.seed}',
+        )
+    )
     os.makedirs(save_dir, exist_ok=True)
 
     # ---- eval_only mode ----
@@ -471,7 +479,7 @@ def main():
         print(f'  Epoch: {ckpt.get("epoch", "?")}, Val Acc: {ckpt.get("val_acc", "?"):.2f}%', flush=True)
 
         test_loss, test_acc = evaluate(model, test_loader, criterion, device, desc='Test')
-        val_loss, val_acc, avg_k, avg_n, keep_pct = evaluate(
+        val_loss, val_acc, avg_k, avg_n, keep_pct, token_stats = evaluate(
             model, val_loader, criterion, device, track_patches=True, desc='Val')
 
         print('\n=== Efficiency Metrics ===', flush=True)
@@ -484,6 +492,7 @@ def main():
         print(f'  Baseline Acc:   {baseline_acc:.2f}%', flush=True)
         print(f'  Acc Diff:       {test_acc - baseline_acc:+.2f}%', flush=True)
         print(f'  Tokens:         {int(avg_k)}/{int(avg_n)} ({keep_pct:.1f}%)', flush=True)
+        print(f'  Token P50/P90:  {token_stats.p50:.0f}/{token_stats.p90:.0f}', flush=True)
         print(f'  Threshold:      {args.threshold}', flush=True)
         print(f'  Latency:        {latency:.2f} ms/sample', flush=True)
         print(f'  Throughput:     {throughput:.2f} samples/sec', flush=True)
@@ -513,8 +522,7 @@ def main():
         best_epoch = ckpt.get('best_epoch', -1)
         print(f'  Resumed from epoch {ckpt["epoch"] + 1}, Best Val: {best_val_acc:.2f}%', flush=True)
 
-    with open(os.path.join(save_dir, 'args.json'), 'w') as f:
-        json.dump(vars(args), f, indent=2)
+    write_result_json(os.path.join(save_dir, 'args.json'), vars(args))
 
     print(f'\n{"="*60}', flush=True)
     print(f'APT Patch Merge ViT-B/16 on {args.dataset} ({epochs} epochs)', flush=True)
@@ -534,12 +542,14 @@ def main():
 
         val_result = evaluate(
             model, val_loader, criterion, device, track_patches=True, desc='Val')
-        val_loss, val_acc, avg_k, avg_n, keep_pct = val_result
+        val_loss, val_acc, avg_k, avg_n, keep_pct, token_stats = val_result
 
         print(f'Epoch {epoch+1}/{epochs}')
         print(f'  Train Loss: {train_loss:.4f}, Acc: {train_acc:.2f}%')
         print(f'  Val   Loss: {val_loss:.4f}, Acc: {val_acc:.2f}%')
         print(f'  Tokens: {int(avg_k)}/{int(avg_n)} ({keep_pct:.1f}%)')
+        print(f'  Token P50/P90: {token_stats.p50:.0f}/{token_stats.p90:.0f}, '
+              f'padded mean: {token_stats.padded_mean:.1f}')
         print(f'  LR: {optimizer.param_groups[0]["lr"]:.6f}')
 
         checkpoint_data = {
@@ -554,36 +564,25 @@ def main():
             'avg_tokens': int(avg_k),
             'avg_total': int(avg_n),
             'keep_pct': keep_pct,
+            'token_stats': token_stats.to_dict(),
         }
         torch.save(checkpoint_data, os.path.join(save_dir, f'checkpoint_epoch_{epoch}.pth'))
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             best_epoch = epoch
-            if val_is_test:
-                checkpoint_data['test_acc'] = val_acc
-                torch.save(checkpoint_data, f'{save_dir}/best_model.pth')
-                print(f'  -> Saved best (Val/Test: {best_val_acc:.2f}%)')
-            else:
-                checkpoint_data['test_acc'] = 0
-                test_result = evaluate(model, test_loader, criterion, device, desc='Test')
-                test_loss_at_best, test_acc_at_best = test_result
-                checkpoint_data['test_acc'] = test_acc_at_best
-                torch.save(checkpoint_data, f'{save_dir}/best_model.pth')
-                print(f'  -> Saved best (Val: {best_val_acc:.2f}%, Test: {test_acc_at_best:.2f}%)')
+            checkpoint_data['test_acc'] = None
+            torch.save(checkpoint_data, f'{save_dir}/best_model.pth')
+            print(f'  -> Saved best validation model ({best_val_acc:.2f}%)')
         print(flush=True)
 
     # ---- Final evaluation ----
-    if val_is_test:
-        test_acc = best_val_acc
-        print('\n=== Best model results ===', flush=True)
-    else:
-        print('\n=== Evaluating best model on test set ===', flush=True)
-        best_path = f'{save_dir}/best_model.pth'
-        if os.path.exists(best_path):
-            ckpt = torch.load(best_path, map_location=device)
-            model.load_state_dict(ckpt['model_state_dict'])
-        test_loss, test_acc = evaluate(model, test_loader, criterion, device, desc='Test')
+    print('\n=== Evaluating frozen best model on test set ===', flush=True)
+    best_path = f'{save_dir}/best_model.pth'
+    if os.path.exists(best_path):
+        ckpt = torch.load(best_path, map_location=device)
+        model.load_state_dict(ckpt['model_state_dict'])
+    test_loss, test_acc = evaluate(model, test_loader, criterion, device, desc='Test')
 
     print('\n=== Efficiency Metrics ===', flush=True)
     latency, throughput = compute_efficiency_metrics(model, test_loader, device)
@@ -601,6 +600,20 @@ def main():
     print(f'  Latency:         {latency:.2f} ms/sample', flush=True)
     print(f'  Throughput:      {throughput:.2f} samples/sec', flush=True)
     print(f'{"="*58}\n', flush=True)
+    write_result_json(os.path.join(save_dir, 'results.json'), {
+        'method': 'apt_merge',
+        'dataset': args.dataset,
+        'seed': args.seed,
+        'threshold': args.threshold,
+        'entropy_bins': args.entropy_bins,
+        'best_val_acc': best_val_acc,
+        'test_acc': test_acc,
+        'baseline_acc': baseline_acc,
+        'acc_diff': acc_diff,
+        'latency_ms': latency,
+        'throughput': throughput,
+        'args': vars(args),
+    })
 
 
 if __name__ == '__main__':

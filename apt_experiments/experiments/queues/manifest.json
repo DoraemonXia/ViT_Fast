@@ -1,0 +1,16 @@
+{
+  "queue_size": 6,
+  "datasets_ready": [
+    "cifar100",
+    "dtd",
+    "food101",
+    "oxford_pets"
+  ],
+  "datasets_missing_scans": [],
+  "short_epochs": 5,
+  "files": [
+    "apt_experiments/experiments/queues/gpu_short_screen.jsonl",
+    "apt_experiments/experiments/queues/gpu_short_screen.ps1",
+    "apt_experiments/experiments/queues/gpu_short_screen.sh"
+  ]
+}

@@ -32,6 +32,13 @@ class ToTensorFixed:
         return _to_tensor(pic)
 
 
+def _split_indices(length, val_ratio, seed=42):
+    n_val = int(length * val_ratio)
+    generator = torch.Generator().manual_seed(seed)
+    indices = torch.randperm(length, generator=generator).tolist()
+    return indices[n_val:], indices[:n_val]
+
+
 def get_cifar10_loader(batch_size=64, data_dir='./data', num_workers=0, image_size=224):
     transform_train = transforms.Compose([
         transforms.Resize(image_size),
@@ -55,7 +62,9 @@ def get_cifar10_loader(batch_size=64, data_dir='./data', num_workers=0, image_si
     return train_loader, test_loader, 10
 
 
-def get_cifar100_loader(batch_size=64, data_dir='./data', num_workers=0, image_size=224, use_randaugment=False):
+def get_cifar100_loader(batch_size=64, data_dir='./data', num_workers=0,
+                        image_size=224, use_randaugment=False,
+                        return_val=False, val_ratio=0.1, split_seed=42):
     transform_list = [
         transforms.Resize(image_size),
         transforms.RandomCrop(image_size, padding=image_size//8),
@@ -78,9 +87,22 @@ def get_cifar100_loader(batch_size=64, data_dir='./data', num_workers=0, image_s
     train_dataset = datasets.CIFAR100(root=data_dir, train=True, download=True, transform=transform_train)
     test_dataset = datasets.CIFAR100(root=data_dir, train=False, download=True, transform=transform_test)
 
+    if return_val:
+        val_dataset_full = datasets.CIFAR100(
+            root=data_dir, train=True, download=True, transform=transform_test)
+        train_indices, val_indices = _split_indices(
+            len(train_dataset), val_ratio, split_seed)
+        train_dataset = Subset(train_dataset, train_indices)
+        val_dataset = Subset(val_dataset_full, val_indices)
+
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
 
+    if return_val:
+        val_loader = DataLoader(
+            val_dataset, batch_size=batch_size, shuffle=False,
+            num_workers=num_workers, pin_memory=True)
+        return train_loader, val_loader, test_loader, 100
     return train_loader, test_loader, 100
 
 
@@ -135,19 +157,17 @@ def get_oxford_pets_loader(batch_size=32, data_dir='./data', num_workers=0, imag
         normalize,
     ])
 
-    # Load trainval set, then split into train + val
+    # Use separate dataset objects so validation never receives train augmentation.
     full_train_dataset = OxfordIIITPet(
         root=data_dir, split='trainval', download=True, transform=transform_train)
+    full_val_dataset = OxfordIIITPet(
+        root=data_dir, split='trainval', download=True, transform=transform_test)
     test_dataset = OxfordIIITPet(
         root=data_dir, split='test', download=True, transform=transform_test)
 
-    n_train = len(full_train_dataset)
-    n_val = int(n_train * val_ratio)
-    n_train_split = n_train - n_val
-
-    gen = torch.Generator().manual_seed(42)
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        full_train_dataset, [n_train_split, n_val], generator=gen)
+    train_indices, val_indices = _split_indices(len(full_train_dataset), val_ratio)
+    train_dataset = Subset(full_train_dataset, train_indices)
+    val_dataset = Subset(full_val_dataset, val_indices)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
                               num_workers=num_workers, pin_memory=True)
@@ -180,12 +200,12 @@ def _make_generic_loader(dataset_class, batch_size, data_dir, num_workers, image
     ])
 
     full_train = dataset_class(root=data_dir, split=train_split, download=True, transform=transform_train)
+    full_val = dataset_class(root=data_dir, split=train_split, download=True, transform=transform_test)
     test_dataset = dataset_class(root=data_dir, split=test_split, download=True, transform=transform_test)
 
-    n_val = int(len(full_train) * val_ratio)
-    n_train = len(full_train) - n_val
-    gen = torch.Generator().manual_seed(42)
-    train_dataset, val_dataset = torch.utils.data.random_split(full_train, [n_train, n_val], generator=gen)
+    train_indices, val_indices = _split_indices(len(full_train), val_ratio)
+    train_dataset = Subset(full_train, train_indices)
+    val_dataset = Subset(full_val, val_indices)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
                               num_workers=num_workers, pin_memory=True)
@@ -244,15 +264,16 @@ def get_flowers102_loader(batch_size=32, data_dir='./data', num_workers=0, image
     # Combine train + val splits for more training data
     train_part = Flowers102(root=data_dir, split='train', download=True, transform=transform_train)
     val_part = Flowers102(root=data_dir, split='val', download=True, transform=transform_train)
+    train_part_eval = Flowers102(root=data_dir, split='train', download=True, transform=transform_test)
+    val_part_eval = Flowers102(root=data_dir, split='val', download=True, transform=transform_test)
     test_dataset = Flowers102(root=data_dir, split='test', download=True, transform=transform_test)
 
     from torch.utils.data import ConcatDataset
     full_train = ConcatDataset([train_part, val_part])
-
-    n_val = int(len(full_train) * val_ratio)
-    n_train = len(full_train) - n_val
-    gen = torch.Generator().manual_seed(42)
-    train_dataset, val_dataset = torch.utils.data.random_split(full_train, [n_train, n_val], generator=gen)
+    full_val = ConcatDataset([train_part_eval, val_part_eval])
+    train_indices, val_indices = _split_indices(len(full_train), val_ratio)
+    train_dataset = Subset(full_train, train_indices)
+    val_dataset = Subset(full_val, val_indices)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
                               num_workers=num_workers, pin_memory=True)

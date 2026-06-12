@@ -1,7 +1,40 @@
+# Datasets and downloaded archives
 data/
-*.pyc
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# Python caches and local environments
 __pycache__/
-checkpoints/**/*.pth
-checkpoints/**/*.json
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Model weights and training artifacts
+checkpoints/*
+!checkpoints/README.md
+apt_experiments/checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
 logs/
+runs/
+wandb/
+
+# Generated APT evaluation summaries
+apt_experiments/experiments/results/
+
+# IDE and local agent state
+.vscode/
+.idea/
 .claude/
+CLAUDE.md
+
+# Operating-system files
+.DS_Store
+Thumbs.db

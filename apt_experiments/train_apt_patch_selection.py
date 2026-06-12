@@ -20,16 +20,16 @@ Features:
 
 Usage:
   # Train (auto-resumes if checkpoint exists)
-  python train_apt_patch_selection.py --dataset cifar100 --gpu 0
+  python apt_experiments/train_apt_patch_selection.py --dataset cifar100 --gpu 0
 
   # Train with custom threshold
-  python train_apt_patch_selection.py --dataset oxford_pets --gpu 0 --threshold 5.0
+  python apt_experiments/train_apt_patch_selection.py --dataset oxford_pets --gpu 0 --threshold 5.0
 
   # Resume from a specific checkpoint
-  python train_apt_patch_selection.py --dataset cifar100 --gpu 0 --resume ./checkpoints/xxx/checkpoint_epoch_5.pth
+  python apt_experiments/train_apt_patch_selection.py --dataset cifar100 --gpu 0 --resume PATH
 
   # Evaluate only (no training)
-  python train_apt_patch_selection.py --dataset cifar100 --gpu 0 --eval_only ./checkpoints/xxx/best_model.pth
+  python apt_experiments/train_apt_patch_selection.py --dataset cifar100 --gpu 0 --eval_only PATH
 """
 import torch
 import torch.nn as nn
@@ -38,11 +38,29 @@ import time
 import os
 import sys
 import math
+import random
 import argparse
 import json
+import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from datasets import get_cifar100_loader, get_oxford_pets_loader, get_food101_loader
+APT_ROOT = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(APT_ROOT)
+sys.path.insert(0, APT_ROOT)
+sys.path.insert(0, PROJECT_ROOT)
+from datasets import (
+    get_cifar100_loader,
+    get_dtd_loader,
+    get_food101_loader,
+    get_oxford_pets_loader,
+)
+from apt_utils import (
+    TokenStatsAccumulator,
+    compute_patch_entropy,
+    denormalize_to_255,
+    get_normalization,
+    run_masked_vit_blocks,
+    write_result_json,
+)
 from tqdm import tqdm
 import timm
 
@@ -51,62 +69,11 @@ import timm
 # ==============================================================================
 
 def compute_patch_entropy_batched(images_255, patch_size=16, num_scales=2,
-                                   bins=256, pad_value=1e6):
-    """Compute entropy maps for batched images. Fully vectorized.
-
-    Args:
-        images_255: (B, C, H, W) tensor in [0, 255] range
-        patch_size: base patch size
-        num_scales: number of scales (1=16x16 only, 2=16x16+32x32)
-        bins: histogram bins
-        pad_value: assign high entropy to padded regions
-
-    Returns:
-        dict {ps: (B, H_ps, W_ps)} entropy maps per patch size
-    """
-    B, C, H, W = images_255.shape
-    device = images_255.device
-
-    if C == 3:
-        w_rgb = torch.tensor([0.2989, 0.5870, 0.1140], device=device).view(1, 3, 1, 1)
-        gray = (images_255 * w_rgb).sum(dim=1)
-    else:
-        gray = images_255[:, 0]
-
-    entropy_maps = {}
+                                   bins=64, pad_value=1e6):
+    """Compatibility wrapper around the shared entropy implementation."""
     patch_sizes = [patch_size * (2 ** i) for i in range(num_scales)]
-
-    for ps in patch_sizes:
-        n_h = (H + ps - 1) // ps
-        n_w = (W + ps - 1) // ps
-
-        pad_h = n_h * ps - H
-        pad_w = n_w * ps - W
-        padded = F.pad(gray, (0, pad_w, 0, pad_h), mode='constant', value=0)
-
-        patches = padded.unfold(1, ps, ps).unfold(2, ps, ps)
-        flat = patches.reshape(B, n_h, n_w, ps * ps)
-
-        # Quantize then histogram via one-hot (memory hungry but fast on GPU)
-        flat_int = (flat * (bins / 256.0)).long().clamp(0, bins - 1)
-        reshaped = flat_int.reshape(-1, ps * ps)
-
-        one_hot = torch.zeros(reshaped.size(0), ps * ps, bins, device=device)
-        one_hot.scatter_(2, reshaped.unsqueeze(2), 1)
-
-        hist = one_hot.sum(1).reshape(B, n_h, n_w, bins)
-        probs = hist.float() / (ps * ps)
-        eps = 1e-10
-        emap = -torch.sum(probs * torch.log2(probs + eps), dim=3)
-
-        if pad_h > 0:
-            emap[:, -1, :] = pad_value
-        if pad_w > 0:
-            emap[:, :, -1] = pad_value
-
-        entropy_maps[ps] = emap
-
-    return entropy_maps
+    return compute_patch_entropy(
+        images_255, patch_sizes=patch_sizes, bins=bins, pad_value=pad_value)
 
 
 # ==============================================================================
@@ -136,17 +103,24 @@ class APTPatchSelectionViT(nn.Module):
 
     def __init__(self, num_classes=100, entropy_threshold=5.0, min_keep=32,
                  max_keep_ratio=0.9, multi_scale=False, img_size=224,
-                 pretrained=True, drop_path_rate=0.0):
+                 pretrained=True, drop_path_rate=0.0,
+                 input_mean=(0.485, 0.456, 0.406),
+                 input_std=(0.229, 0.224, 0.225),
+                 entropy_bins=64,
+                 backbone_name='vit_base_patch16_224.augreg_in21k'):
         super().__init__()
         self.entropy_threshold = entropy_threshold
         self.min_keep = min_keep
         self.max_keep_ratio = max_keep_ratio
         self.multi_scale = multi_scale
         self.img_size = img_size
+        self.input_mean = input_mean
+        self.input_std = input_std
+        self.entropy_bins = entropy_bins
 
         # Load ViT-B/16 IN-21K backbone
         backbone = timm.create_model(
-            'vit_base_patch16_224.augreg_in21k',
+            backbone_name,
             pretrained=pretrained,
             num_classes=num_classes,
             drop_path_rate=drop_path_rate,
@@ -166,6 +140,7 @@ class APTPatchSelectionViT(nn.Module):
         # For logging
         self._last_k = self.num_patches
         self._last_n = self.num_patches
+        self._last_token_counts = None
 
         del backbone
 
@@ -182,14 +157,12 @@ class APTPatchSelectionViT(nn.Module):
         # ---------------------------------------------------------------
         # Step 1: Compute entropy maps on unnnormalized [0,255] images
         # ---------------------------------------------------------------
-        # Unnormalize: x ~ N(0,1) → [0,255]
-        mean = torch.tensor([0.5, 0.5, 0.5], device=x.device).view(1, 3, 1, 1)
-        std = torch.tensor([0.5, 0.5, 0.5], device=x.device).view(1, 3, 1, 1)
-        images_255 = ((x * std + mean) * 255.0).clamp(0, 255)
+        images_255 = denormalize_to_255(x, self.input_mean, self.input_std)
 
         num_scales = 2 if self.multi_scale else 1
         entropy_maps = compute_patch_entropy_batched(
-            images_255, patch_size=16, num_scales=num_scales, bins=256)
+            images_255, patch_size=16, num_scales=num_scales,
+            bins=self.entropy_bins)
 
         # ---------------------------------------------------------------
         # Step 2: Patch embedding (ALL patches, needed for router baseline)
@@ -205,20 +178,24 @@ class APTPatchSelectionViT(nn.Module):
 
         if self.multi_scale:
             # Multi-scale: high-entropy keep 16x16, low-entropy merge to 32x32
-            indices, keep_mask = self._select_multiscale(ent_flat, entropy_maps, x_patches)
+            indices, keep_mask, valid_tokens, token_counts = self._select_multiscale(
+                ent_flat, entropy_maps, x_patches)
         else:
             # Single-scale: keep patches above entropy threshold
-            indices, keep_mask = self._select_threshold(ent_flat)
+            indices, keep_mask, valid_tokens, token_counts = self._select_threshold(
+                ent_flat)
 
         K = indices.shape[1]
         self._last_k = K
         self._last_n = N
+        self._last_token_counts = token_counts.detach()
 
         # ---------------------------------------------------------------
         # Step 4: Gather selected patches + positional embeddings
         # ---------------------------------------------------------------
         batch_idx = torch.arange(B, device=x.device).unsqueeze(1).expand(-1, K)
         selected = x_patches[batch_idx, indices]  # (B, K, D)
+        selected = selected * valid_tokens.unsqueeze(-1).to(selected.dtype)
 
         # Add CLS token
         cls_tokens = self.cls_token.expand(B, -1, -1)
@@ -234,8 +211,11 @@ class APTPatchSelectionViT(nn.Module):
         # ---------------------------------------------------------------
         # Step 5: Transformer blocks → classification
         # ---------------------------------------------------------------
-        for block in self.blocks:
-            h = block(h)
+        sequence_valid = torch.cat([
+            torch.ones(B, 1, dtype=torch.bool, device=x.device),
+            valid_tokens,
+        ], dim=1)
+        h = run_masked_vit_blocks(self.blocks, h, sequence_valid)
         h = self.norm(h)
         logits = self.head(h[:, 0])
 
@@ -283,7 +263,11 @@ class APTPatchSelectionViT(nn.Module):
                     # Duplicate last kept if needed (edge case)
                     indices[i, ki:] = kept_i[-1]
 
-        return indices, keep_mask.float()
+        valid_tokens = (
+            torch.arange(K, device=ent_flat.device).unsqueeze(0)
+            < num_kept.unsqueeze(1)
+        )
+        return indices, keep_mask.float(), valid_tokens, num_kept.long()
 
     def _select_multiscale(self, ent_flat, entropy_maps, x_patches):
         """
@@ -326,12 +310,14 @@ DATASETS = {
     'cifar100':    (get_cifar100_loader,     100, 100),
     'oxford_pets': (get_oxford_pets_loader,   37, 100),
     'food101':     (get_food101_loader,      101,  30),
+    'dtd':         (get_dtd_loader,            47, 100),
 }
 
 BASELINE_ACC = {
     'cifar100':   91.69,
     'oxford_pets': 93.81,
     'food101':    91.37,
+    'dtd':        80.85,
 }
 
 
@@ -392,7 +378,7 @@ def evaluate(model, loader, criterion, device, track_patches=False, desc='Eval')
     total_loss = 0.0
     correct = 0
     total = 0
-    kept_patches = []
+    token_stats = TokenStatsAccumulator() if track_patches else None
     pbar = tqdm(loader, total=len(loader), desc=desc, unit='batch', dynamic_ncols=True)
     for images, targets in pbar:
         images, targets = images.to(device), targets.to(device)
@@ -403,17 +389,18 @@ def evaluate(model, loader, criterion, device, track_patches=False, desc='Eval')
         total += targets.size(0)
         correct += predicted.eq(targets).sum().item()
         if track_patches:
-            kept_patches.append(model._last_k)
+            token_stats.update(model._last_token_counts, model._last_k)
         pbar.set_postfix({
             'loss': f'{total_loss / (pbar.n if pbar.n else 1):.4f}',
             'acc': f'{100.0 * correct / total:.1f}%',
         })
 
     result = (total_loss / len(loader), 100.0 * correct / total)
-    if track_patches and kept_patches:
-        avg_k = sum(kept_patches) / len(kept_patches)
+    if track_patches:
+        stats = token_stats.compute()
+        avg_k = stats.mean
         avg_n = model._last_n
-        result = result + (avg_k, avg_n, avg_k / avg_n * 100)
+        result = result + (avg_k, avg_n, avg_k / avg_n * 100, stats)
     return result
 
 
@@ -472,16 +459,28 @@ def main():
     parser.add_argument('--epochs', type=int, default=None,
                         help='Override default epoch count')
     parser.add_argument('--image_size', type=int, default=224)
+    parser.add_argument('--entropy_bins', type=int, default=64)
+    parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from')
     parser.add_argument('--eval_only', type=str, default=None,
                         help='Only evaluate using the given checkpoint path (no training)')
     args = parser.parse_args()
 
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
     device = f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu'
     print(f'Device: {device}', flush=True)
     if torch.cuda.is_available():
         print(f'GPU: {torch.cuda.get_device_name(args.gpu)}', flush=True)
+    elif args.eval_only is None:
+        raise RuntimeError(
+            'CUDA is required for training. CPU is limited to direct model smoke tests.'
+        )
 
     loader_fn, num_classes, epochs = DATASETS[args.dataset]
     if args.epochs is not None:
@@ -498,8 +497,12 @@ def main():
     print(f'  Baseline Acc: {BASELINE_ACC[args.dataset]:.2f}%', flush=True)
 
     # Data
-    result = loader_fn(batch_size=args.batch_size, data_dir='./data',
-                       num_workers=4, image_size=args.image_size)
+    loader_kwargs = dict(batch_size=args.batch_size,
+                         data_dir=os.path.join(PROJECT_ROOT, 'data'),
+                         num_workers=4, image_size=args.image_size)
+    if args.dataset == 'cifar100':
+        loader_kwargs['return_val'] = True
+    result = loader_fn(**loader_kwargs)
     if len(result) == 4:
         train_loader, val_loader, test_loader, n_cls = result
         val_is_test = False
@@ -521,6 +524,9 @@ def main():
         max_keep_ratio=args.max_keep_ratio,
         multi_scale=args.multi_scale,
         img_size=args.image_size,
+        input_mean=get_normalization(args.dataset)[0],
+        input_std=get_normalization(args.dataset)[1],
+        entropy_bins=args.entropy_bins,
     )
     model = model.to(device)
     total_params = sum(p.numel() for p in model.parameters()) / 1e6
@@ -535,7 +541,13 @@ def main():
     best_val_acc = 0.0
     best_epoch = -1
     start_epoch = 0
-    save_dir = f'./checkpoints/{args.dataset}_apt_entropy_t{args.threshold}'
+    save_dir = (
+        os.path.join(
+            APT_ROOT,
+            'checkpoints',
+            f'{args.dataset}_apt_entropy_t{args.threshold}_s{args.seed}',
+        )
+    )
     if args.multi_scale:
         save_dir += '_multiscale'
     os.makedirs(save_dir, exist_ok=True)
@@ -550,7 +562,7 @@ def main():
 
         print('\n=== Evaluating on test set ===', flush=True)
         test_loss, test_acc = evaluate(model, test_loader, criterion, device, desc='Test')
-        val_loss, val_acc, avg_k, avg_n, keep_pct = evaluate(
+        val_loss, val_acc, avg_k, avg_n, keep_pct, token_stats = evaluate(
             model, val_loader, criterion, device, track_patches=True, desc='Val')
 
         print('\n=== Efficiency Metrics ===', flush=True)
@@ -565,6 +577,7 @@ def main():
         print(f'  Baseline Acc:   {baseline_acc:.2f}%', flush=True)
         print(f'  Acc Diff:       {acc_diff:+.2f}%', flush=True)
         print(f'  Keep:           {int(avg_k)}/{int(avg_n)} patches ({keep_pct:.1f}%)', flush=True)
+        print(f'  Token P50/P90:  {token_stats.p50:.0f}/{token_stats.p90:.0f}', flush=True)
         print(f'  Threshold:      {args.threshold}', flush=True)
         print(f'  --------------------------------------------', flush=True)
         print(f'  Latency:         {latency:.2f} ms/sample', flush=True)
@@ -597,8 +610,7 @@ def main():
         print(f'  Resumed from epoch {ckpt["epoch"] + 1}, Best Val Acc: {best_val_acc:.2f}%', flush=True)
 
     # Save args for reproducibility
-    with open(os.path.join(save_dir, 'args.json'), 'w') as f:
-        json.dump(vars(args), f, indent=2)
+    write_result_json(os.path.join(save_dir, 'args.json'), vars(args))
 
     print(f'\n{"="*60}', flush=True)
     print(f'APT Patch Selection ViT-B/16 on {args.dataset} ({epochs} epochs)', flush=True)
@@ -618,12 +630,14 @@ def main():
 
         val_result = evaluate(
             model, val_loader, criterion, device, track_patches=True, desc='Val')
-        val_loss, val_acc, avg_k, avg_n, keep_pct = val_result
+        val_loss, val_acc, avg_k, avg_n, keep_pct, token_stats = val_result
 
         print(f'Epoch {epoch+1}/{epochs}')
         print(f'  Train Loss: {train_loss:.4f}, Acc: {train_acc:.2f}%')
         print(f'  Val   Loss: {val_loss:.4f}, Acc: {val_acc:.2f}%')
         print(f'  Keep:  {int(avg_k)}/{int(avg_n)} patches ({keep_pct:.1f}%)')
+        print(f'  Token P50/P90: {token_stats.p50:.0f}/{token_stats.p90:.0f}, '
+              f'padded mean: {token_stats.padded_mean:.1f}')
         print(f'  LR: {optimizer.param_groups[0]["lr"]:.6f}')
 
         # Save checkpoint after every epoch
@@ -639,38 +653,25 @@ def main():
             'avg_keep': int(avg_k),
             'avg_total': int(avg_n),
             'keep_pct': keep_pct,
+            'token_stats': token_stats.to_dict(),
         }
         torch.save(checkpoint_data, os.path.join(save_dir, f'checkpoint_epoch_{epoch}.pth'))
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             best_epoch = epoch
-            # Save best model: if val==test, val_acc is the truth; else run test eval
-            if val_is_test:
-                checkpoint_data['test_acc'] = val_acc
-                torch.save(checkpoint_data, f'{save_dir}/best_model.pth')
-                print(f'  -> Saved best (Val/Test: {best_val_acc:.2f}%)')
-            else:
-                checkpoint_data['test_acc'] = 0
-                test_result = evaluate(model, test_loader, criterion, device, desc='Test')
-                test_loss_at_best, test_acc_at_best = test_result
-                checkpoint_data['test_acc'] = test_acc_at_best
-                torch.save(checkpoint_data, f'{save_dir}/best_model.pth')
-                print(f'  -> Saved best (Val: {best_val_acc:.2f}%, Test: {test_acc_at_best:.2f}%)')
+            checkpoint_data['test_acc'] = None
+            torch.save(checkpoint_data, f'{save_dir}/best_model.pth')
+            print(f'  -> Saved best validation model ({best_val_acc:.2f}%)')
         print(flush=True)
 
     # ---- Final evaluation ----
-    if val_is_test:
-        # Val and test are the same; use the best val_acc directly
-        test_acc = best_val_acc
-        print('\n=== Best model results ===', flush=True)
-    else:
-        print('\n=== Evaluating best model on test set ===', flush=True)
-        best_path = f'{save_dir}/best_model.pth'
-        if os.path.exists(best_path):
-            ckpt = torch.load(best_path, map_location=device)
-            model.load_state_dict(ckpt['model_state_dict'])
-        test_loss, test_acc = evaluate(model, test_loader, criterion, device, desc='Test')
+    print('\n=== Evaluating frozen best model on test set ===', flush=True)
+    best_path = f'{save_dir}/best_model.pth'
+    if os.path.exists(best_path):
+        ckpt = torch.load(best_path, map_location=device)
+        model.load_state_dict(ckpt['model_state_dict'])
+    test_loss, test_acc = evaluate(model, test_loader, criterion, device, desc='Test')
 
     # Efficiency
     print('\n=== Efficiency Metrics ===', flush=True)
@@ -691,6 +692,20 @@ def main():
     print(f'  Latency:         {latency:.2f} ms/sample', flush=True)
     print(f'  Throughput:      {throughput:.2f} samples/sec', flush=True)
     print(f'{"="*58}\n', flush=True)
+    write_result_json(os.path.join(save_dir, 'results.json'), {
+        'method': 'apt_selection',
+        'dataset': args.dataset,
+        'seed': args.seed,
+        'threshold': args.threshold,
+        'entropy_bins': args.entropy_bins,
+        'best_val_acc': best_val_acc,
+        'test_acc': test_acc,
+        'baseline_acc': baseline_acc,
+        'acc_diff': acc_diff,
+        'latency_ms': latency,
+        'throughput': throughput,
+        'args': vars(args),
+    })
 
 
 if __name__ == '__main__':

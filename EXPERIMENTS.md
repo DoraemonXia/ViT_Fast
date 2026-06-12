@@ -12,8 +12,10 @@
 | `train.py` | 通用训练脚本（支持 baseline、patch selection、MAE finetune 等） |
 | `train_patch_selection_mae.py` | MAE patch selection 专用训练脚本（含蒸馏 router 加载） |
 | `train_router_distill.py` | Attention Distillation 训练脚本 |
-| `train_apt_patch_selection.py` | **APT 熵值 patch selection 训练脚本（新）** |
-| `train_apt_patch_merge.py` | **APT 多尺度 patch merge 训练脚本（新）** |
+| `apt_experiments/` | **独立 APT 子工程；GPU 流程见 `apt_experiments/GPU_WORKFLOW.md`** |
+| `apt_experiments/train_apt_patch_selection.py` | APT 熵值 patch selection |
+| `apt_experiments/train_apt_patch_merge.py` | APT 固定 16/32 patch merge |
+| `apt_experiments/train_hierarchical_apt.py` | 层次化多尺度 APT |
 | `test_patch_selection_b16.py` | 旧 Gumbel patch selection 测试脚本 |
 | `test_blur_downsample.py` | 图片模糊/降采样测试脚本 |
 | `test_stride_patches.py` | 不同 stride 下 patch 数量 vs 精度测试脚本 |
@@ -304,22 +306,22 @@ MLP Router（学生）→ 从 patch embedding 预测重要性分数 → MSE Loss
 
 ```bash
 # CIFAR-100
-python train_apt_patch_selection.py --dataset cifar100 --gpu 0 --threshold 5.5
+python apt_experiments/train_apt_patch_selection.py --dataset cifar100 --gpu 0 --threshold 5.5
 
 # Oxford Pets
-python train_apt_patch_selection.py --dataset oxford_pets --gpu 0 --threshold 5.5
+python apt_experiments/train_apt_patch_selection.py --dataset oxford_pets --gpu 0 --threshold 5.5
 
 # Food-101
-python train_apt_patch_selection.py --dataset food101 --gpu 0 --threshold 5.5
+python apt_experiments/train_apt_patch_selection.py --dataset food101 --gpu 0 --threshold 5.5
 
 # 断点续训（自动从最新 checkpoint 恢复）
 # 直接重新运行相同命令即可
 
 # 仅评估（不训练）
-python train_apt_patch_selection.py --dataset cifar100 --gpu 0 --eval_only ./checkpoints/cifar100_apt_entropy_t5.5/best_model.pth
+python apt_experiments/train_apt_patch_selection.py --dataset cifar100 --gpu 0 --eval_only PATH
 
 # 自定义阈值
-python train_apt_patch_selection.py --dataset cifar100 --gpu 0 --threshold 4.0 --min_keep 16 --max_keep_ratio 0.8
+python apt_experiments/train_apt_patch_selection.py --dataset cifar100 --gpu 0 --threshold 4.0 --min_keep 16 --max_keep_ratio 0.8
 ```
 
 ### 参数
@@ -370,13 +372,13 @@ python train_apt_patch_selection.py --dataset cifar100 --gpu 0 --threshold 4.0 -
 
 ```bash
 # CIFAR-100
-python train_apt_patch_merge.py --dataset cifar100 --gpu 0 --threshold 5.5
+python apt_experiments/train_apt_patch_merge.py --dataset cifar100 --gpu 0 --threshold 5.5
 
 # Oxford Pets
-python train_apt_patch_merge.py --dataset oxford_pets --gpu 0 --threshold 5.5
+python apt_experiments/train_apt_patch_merge.py --dataset oxford_pets --gpu 0 --threshold 5.5
 
 # 仅评估
-python train_apt_patch_merge.py --dataset cifar100 --gpu 0 --eval_only PATH
+python apt_experiments/train_apt_patch_merge.py --dataset cifar100 --gpu 0 --eval_only PATH
 ```
 
 ### 参数

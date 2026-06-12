@@ -27,8 +27,7 @@
 ├── train.py                      # 通用训练脚本（baseline / Gumbel）
 ├── train_patch_selection_mae.py  # MAE + Router 训练脚本
 ├── train_router_distill.py       # 注意力蒸馏脚本
-├── train_apt_patch_selection.py  # APT 熵值 patch selection（新）
-├── train_apt_patch_merge.py      # APT 多尺度 patch merge（新）
+├── apt_experiments/              # 独立 APT 实验子工程
 ├── datasets.py                   # 数据集加载器
 ├── docs/
 │   ├── research_story.md         # 研究叙事（给读者看）
@@ -85,10 +84,10 @@ python train_router_distill.py --dataset cifar100 --gpu 0
 python train_patch_selection_mae.py --dataset cifar100 --gpu 0   --router_path ./checkpoints/router_distill_cifar100/router.pth
 
 # APT Selection（熵值丢弃低信息量 patch）
-python train_apt_patch_selection.py --dataset cifar100 --gpu 0 --threshold 5.5
+python apt_experiments/train_apt_patch_selection.py --dataset cifar100 --gpu 0 --threshold 5.5
 
 # APT Merge（熵值低区域 2×2 合并为 1 token）
-python train_apt_patch_merge.py --dataset cifar100 --gpu 0 --threshold 5.5
+python apt_experiments/train_apt_patch_merge.py --dataset cifar100 --gpu 0 --threshold 5.5
 ```## 模型权重
 
 预训练 ViT-B/16 来自 `timm`（`vit_base_patch16_224.augreg_in21k`），自动下载。
