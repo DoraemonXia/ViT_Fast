@@ -8,3 +8,22 @@ checkpoints/**/*.pth
 checkpoints/**/*.json
 logs/
 .claude/
+
+CLAUDE.md
+
+# Local assistant / cache files
+.claude/
+.cache/
+__pycache__/
+
+# Local experiment artifacts
+apt_experiments/results_downloaded/
+apt_experiments/experiments/scans/
+apt_experiments/experiments/queues/
+
+# More local experiment artifacts
+apt_experiments/experiments/results/
+apt_experiments/pretrained/*.safetensors
+apt_experiments/pretrained/*.pt
+apt_experiments/pretrained/*.pth
+apt_experiments/pretrained/*.ckpt
