@@ -32,7 +32,7 @@ import torch.nn as nn
 import timm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from datasets import get_cifar100_loader, get_food101_loader, get_oxford_pets_loader
+from datasets import get_cifar100_loader, get_dtd_loader, get_food101_loader, get_oxford_pets_loader
 
 try:
     from tqdm import tqdm
@@ -49,6 +49,7 @@ DATASETS = {
     "cifar100": (get_cifar100_loader, 100, "cifar100_vit_b16_ft"),
     "oxford_pets": (get_oxford_pets_loader, 37, "oxford_pets_vit_b16_ft"),
     "food101": (get_food101_loader, 101, "food101_vit_b16_in21k"),
+    "dtd": (get_dtd_loader, 47, "dtd_vit_b16_in21k"),
 }
 
 CHECKPOINTS = {
