@@ -5,3 +5,4 @@ fvcore
 Pillow
 numpy
 tqdm
+safetensors
